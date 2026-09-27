@@ -1,0 +1,104 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(name: 'ENVIRONMENT', choices: ['dev', 'uat', 'prod'], description: 'Target environment')
+    }
+
+    environment {
+        REPO    = 'https://github.com/sadhix-admin14/nodejsrepo.git'
+        CRED_ID = 'ssh-keys'
+        PORT    = '3000'
+    }
+
+    triggers {
+        githubPush()   // auto-fires on push to main; runs with default param (dev)
+    }
+
+    stages {
+
+        stage('Authorize') {
+            steps {
+                script {
+                    // Who/what triggered this build - inspect generically, no hardcoded class name
+                    def causes = currentBuild.getBuildCauses()
+                    def triggeredBy = 'unknown'
+
+                    if (causes) {
+                        def c = causes[0]
+                        if (c._class?.contains('UserIdCause') && c.userId) {
+                            triggeredBy = c.userId
+                        } else if (c.shortDescription?.toLowerCase()?.contains('github push') ||
+                                   c._class?.toLowerCase()?.contains('githubpush')) {
+                            triggeredBy = 'webhook'
+                        }
+                    }
+
+                    env.TRIGGERED_BY = triggeredBy
+                    echo "Build cause detected: ${causes}"
+
+                    // Who is allowed to deploy where
+                    def allowed = [
+                        dev : ['webhook', 'admin'],
+                        uat : ['tom', 'admin'],
+                        prod: ['ricky', 'admin']
+                    ]
+
+                    if (!allowed[params.ENVIRONMENT].contains(triggeredBy)) {
+                        error("Access denied: '${triggeredBy}' is not authorized to deploy to '${params.ENVIRONMENT}'.")
+                    }
+
+                    echo "Authorized: '${triggeredBy}' deploying to '${params.ENVIRONMENT}'"
+
+                    def servers = [
+                        dev : ['3.144.232.90', '/opt/dev-release'],
+                        uat : ['77.113.57.28',  '/opt/uat-release'],
+                        prod: ['3.14.147.64',   '/opt/prod-release']
+                    ]
+                    env.TARGET_IP   = servers[params.ENVIRONMENT][0]
+                    env.TARGET_PATH = servers[params.ENVIRONMENT][1]
+                }
+            }
+        }
+
+        stage('Checkout') {
+            steps {
+                deleteDir()
+                git(branch: 'main', url: env.REPO)
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh '''
+                    set -e
+                    npm ci
+                    npm prune --production
+                '''
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: env.CRED_ID, keyFileVariable: 'SSH_KEY')]) {
+                    sh '''
+                        set -e
+                        SSH_OPTS="-o StrictHostKeyChecking=no -i $SSH_KEY"
+
+                        ssh $SSH_OPTS ubuntu@"$TARGET_IP" "mkdir -p '$TARGET_PATH'"
+
+                        rsync -az --delete --exclude='.git' -e "ssh $SSH_OPTS" \
+                            ./ ubuntu@"$TARGET_IP":"$TARGET_PATH/"
+
+                        ssh $SSH_OPTS ubuntu@"$TARGET_IP" "
+                            pm2 delete nodeapp 2>/dev/null || true
+                            cd '$TARGET_PATH' &&
+                            PORT=$PORT pm2 start index.js --name nodeapp &&
+                            pm2 save
+                        "
+                    '''
+                }
+            }
+        }
+    }
+}
